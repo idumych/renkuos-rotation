@@ -1,0 +1,630 @@
+From 45376dc35d3afe57a077846db438b178ab352533 Mon Sep 17 00:00:00 2001
+From: Personal <idumych@gmail.com>
+Date: Fri, 16 Oct 2026 13:20:07 -0700
+Subject: [PATCH] app_server: software display rotation (personal patch)
+
+Reads ~/config/settings/display_rotation at startup ("display right",
+"left", "inverted", or 0/90/180/270). The back buffer gets the rotated
+size and is copied turned into the physical frame buffer; display modes
+are swapped at the HWInterface boundary so everything above it sees the
+rotated screen. Hardware cursor, overlays and BDirectWindow are turned
+off while rotated, screenshots read from the back buffer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WwH5PZZRHHZuu8kGTV9wBF
+---
+ headers/private/shared/DisplayRotation.h      | 104 +++++++++++++
+ src/servers/app/ServerWindow.cpp              |   6 +-
+ src/servers/app/drawing/DrawingEngine.cpp     |   5 +-
+ src/servers/app/drawing/HWInterface.cpp       | 143 ++++++++++++++++++
+ src/servers/app/drawing/HWInterface.h         |   9 ++
+ .../interface/local/AccelerantHWInterface.cpp | 115 ++++++++++++--
+ .../interface/local/AccelerantHWInterface.h   |   5 +
+ 7 files changed, 374 insertions(+), 13 deletions(-)
+ create mode 100644 headers/private/shared/DisplayRotation.h
+
+diff --git a/headers/private/shared/DisplayRotation.h b/headers/private/shared/DisplayRotation.h
+new file mode 100644
+index 0000000..e8a6752
+--- /dev/null
++++ b/headers/private/shared/DisplayRotation.h
+@@ -0,0 +1,104 @@
++/*
++ * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ *
++ * Personal patch: software display rotation.
++ *
++ * Settings file: ~/config/settings/display_rotation
++ *
++ *	display right_side_up	# see below
++ *	touch right_side_up		# optional, defaults to the display value
++ *
++ * Values:
++ *	normal, right (90), inverted (180), left (270) - how far the picture is
++ *		turned clockwise on the panel
++ *	right_side_up, left_side_up, bottom_up - the Linux/DRM names for how the
++ *		panel is mounted; right_side_up is the same as left, left_side_up
++ *		the same as right
++ * If the desktop comes up upside down, pick the opposite value.
++ */
++#ifndef _DISPLAY_ROTATION_H
++#define _DISPLAY_ROTATION_H
++
++
++#include <FindDirectory.h>
++#include <ctype.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++
++
++namespace BPrivate {
++
++
++static inline int
++parse_display_rotation(const char* value)
++{
++	if (strcasecmp(value, "right") == 0 || strcmp(value, "90") == 0
++		|| strcasecmp(value, "cw") == 0
++		|| strcasecmp(value, "left_side_up") == 0)
++		return 90;
++	if (strcasecmp(value, "inverted") == 0 || strcmp(value, "180") == 0
++		|| strcasecmp(value, "upside_down") == 0
++		|| strcasecmp(value, "bottom_up") == 0)
++		return 180;
++	if (strcasecmp(value, "left") == 0 || strcmp(value, "270") == 0
++		|| strcasecmp(value, "ccw") == 0
++		|| strcasecmp(value, "right_side_up") == 0)
++		return 270;
++	return 0;
++}
++
++
++/*!	Reads the rotation for \a key ("display" or "touch"), in clockwise
++	degrees (0, 90, 180 or 270). A missing "touch" entry falls back to
++	"display"; a missing file means no rotation.
++*/
++static inline int
++get_display_rotation(const char* key)
++{
++	char path[B_PATH_NAME_LENGTH];
++	if (find_directory(B_USER_SETTINGS_DIRECTORY, -1, false, path,
++			sizeof(path)) != B_OK) {
++		return 0;
++	}
++	strlcat(path, "/display_rotation", sizeof(path));
++
++	FILE* file = fopen(path, "r");
++	if (file == NULL)
++		return 0;
++
++	int display = 0;
++	int touch = -1;
++	char line[128];
++	while (fgets(line, sizeof(line), file) != NULL) {
++		char* hash = strchr(line, '#');
++		if (hash != NULL)
++			*hash = '\0';
++
++		char name[32];
++		char value[32];
++		int count = sscanf(line, "%31s %31s", name, value);
++		if (count == 1) {
++			// a bare value means the display rotation
++			display = parse_display_rotation(name);
++		} else if (count == 2) {
++			if (strcasecmp(name, "display") == 0)
++				display = parse_display_rotation(value);
++			else if (strcasecmp(name, "touch") == 0)
++				touch = parse_display_rotation(value);
++		}
++	}
++	fclose(file);
++
++	if (strcmp(key, "touch") == 0 && touch >= 0)
++		return touch;
++	return display;
++}
++
++
++}	// namespace BPrivate
++
++
++#endif	// _DISPLAY_ROTATION_H
+diff --git a/src/servers/app/ServerWindow.cpp b/src/servers/app/ServerWindow.cpp
+index fd3f262..200adef 100644
+--- a/src/servers/app/ServerWindow.cpp
++++ b/src/servers/app/ServerWindow.cpp
+@@ -4583,8 +4583,10 @@ ServerWindow::_EnableDirectWindowMode()
+ 		return B_ERROR;
+ 	}
+ 
+-	if (fDesktop->HWInterface()->FrontBuffer() == NULL) {
+-		// direct window mode not supported
++	if (fDesktop->HWInterface()->FrontBuffer() == NULL
++		|| fDesktop->HWInterface()->Rotation() != 0) {
++		// direct window mode not supported (with a rotated display the
++		// client would draw into the sideways frame buffer)
+ 		return B_UNSUPPORTED;
+ 	}
+ 
+diff --git a/src/servers/app/drawing/DrawingEngine.cpp b/src/servers/app/drawing/DrawingEngine.cpp
+index 7dc13d5..1740397 100644
+--- a/src/servers/app/drawing/DrawingEngine.cpp
++++ b/src/servers/app/drawing/DrawingEngine.cpp
+@@ -1376,7 +1376,10 @@ DrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor, BRect bounds)
+ {
+ 	ASSERT_EXCLUSIVE_LOCKED();
+ 
+-	RenderingBuffer* buffer = fGraphicsCard->FrontBuffer();
++	// with a rotated display the front buffer is turned sideways, the back
++	// buffer has the picture the way applications see it
++	RenderingBuffer* buffer = fGraphicsCard->Rotation() != 0
++		? fGraphicsCard->BackBuffer() : fGraphicsCard->FrontBuffer();
+ 	if (buffer == NULL)
+ 		return B_ERROR;
+ 
+diff --git a/src/servers/app/drawing/HWInterface.cpp b/src/servers/app/drawing/HWInterface.cpp
+index 35b431f..da85bc3 100644
+--- a/src/servers/app/drawing/HWInterface.cpp
++++ b/src/servers/app/drawing/HWInterface.cpp
+@@ -52,6 +52,7 @@ HWInterface::HWInterface()
+ 	fHardwareCursorEnabled(false),
+ 	fCursorLocation(0, 0),
+ 	fVGADevice(-1),
++	fRotation(0),
+ 	fListeners(20)
+ {
+ }
+@@ -656,6 +657,11 @@ void
+ HWInterface::_CopyToFront(uint8* src, uint32 srcBPR, int32 x, int32 y,
+ 	int32 right, int32 bottom) const
+ {
++	if (fRotation != 0) {
++		_CopyToFrontRotated(src, srcBPR, x, y, right, bottom);
++		return;
++	}
++
+ 	RenderingBuffer* frontBuffer = FrontBuffer();
+ 
+ 	uint8* dst = (uint8*)frontBuffer->Bits();
+@@ -878,6 +884,143 @@ HWInterface::_CopyToFront(uint8* src, uint32 srcBPR, int32 x, int32 y,
+ }
+ 
+ 
++/*!	Rotated variant of _CopyToFront().
++	\a src points at logical pixel (x, y) of a B_RGBA32 buffer, the rectangle
++	is given in logical (rotated) coordinates. It is written to the physical
++	front buffer turned by fRotation degrees clockwise.
++
++	The loop walks the destination row by row, so writes to the (usually
++	write-combined) frame buffer stay sequential; the strided accesses are
++	reads from the back buffer in normal memory instead.
++*/
++void
++HWInterface::_CopyToFrontRotated(uint8* src, uint32 srcBPR, int32 x, int32 y,
++	int32 right, int32 bottom) const
++{
++	RenderingBuffer* frontBuffer = FrontBuffer();
++	RenderingBuffer* backBuffer = BackBuffer();
++	if (frontBuffer == NULL || backBuffer == NULL || right < x || bottom < y)
++		return;
++
++	// logical screen size
++	const int32 width = backBuffer->Width();
++	const int32 height = backBuffer->Height();
++
++	// destination rectangle in physical coordinates, plus how far to step
++	// in the source for each physical pixel to the right
++	int32 dstLeft, dstTop, dstRight, dstBottom;
++	int32 srcStep;
++	switch (fRotation) {
++		case 90:
++			// logical (lx, ly) -> physical (height - 1 - ly, lx)
++			dstLeft = height - 1 - bottom;
++			dstRight = height - 1 - y;
++			dstTop = x;
++			dstBottom = right;
++			srcStep = -(int32)srcBPR;
++			break;
++		case 180:
++			// logical (lx, ly) -> physical (width - 1 - lx, height - 1 - ly)
++			dstLeft = width - 1 - right;
++			dstRight = width - 1 - x;
++			dstTop = height - 1 - bottom;
++			dstBottom = height - 1 - y;
++			srcStep = -4;
++			break;
++		case 270:
++			// logical (lx, ly) -> physical (ly, width - 1 - lx)
++			dstLeft = y;
++			dstRight = bottom;
++			dstTop = width - 1 - right;
++			dstBottom = width - 1 - x;
++			srcStep = (int32)srcBPR;
++			break;
++		default:
++			return;
++	}
++
++	// never write outside the physical frame buffer
++	if (dstLeft < 0 || dstTop < 0
++		|| dstRight >= (int32)frontBuffer->Width()
++		|| dstBottom >= (int32)frontBuffer->Height()) {
++		return;
++	}
++
++	uint8* dst = (uint8*)frontBuffer->Bits();
++	const uint32 dstBPR = frontBuffer->BytesPerRow();
++	const color_space space = frontBuffer->ColorSpace();
++
++	for (int32 py = dstTop; py <= dstBottom; py++) {
++		// source pixel that lands on (dstLeft, py)
++		const uint8* s;
++		switch (fRotation) {
++			case 90:
++				// lx = py; px == dstLeft means ly == bottom
++				s = src + (bottom - y) * srcBPR + (py - x) * 4;
++				break;
++			case 180:
++				// ly = height - 1 - py; px == dstLeft means lx == right
++				s = src + (height - 1 - py - y) * srcBPR + (right - x) * 4;
++				break;
++			default:
++				// 270: lx = width - 1 - py; px == dstLeft means ly == y
++				s = src + (width - 1 - py - x) * 4;
++				break;
++		}
++
++		switch (space) {
++			case B_RGB32:
++			case B_RGBA32:
++			{
++				uint32* d = (uint32*)(dst + py * dstBPR) + dstLeft;
++				for (int32 px = dstLeft; px <= dstRight; px++) {
++					*d++ = *(const uint32*)s;
++					s += srcStep;
++				}
++				break;
++			}
++			case B_RGB16:
++			{
++				uint16* d = (uint16*)(dst + py * dstBPR) + dstLeft;
++				for (int32 px = dstLeft; px <= dstRight; px++) {
++					*d++ = (uint16)(((s[2] & 0xf8) << 8)
++						| ((s[1] & 0xfc) << 3) | (s[0] >> 3));
++					s += srcStep;
++				}
++				break;
++			}
++			case B_RGB15:
++			case B_RGBA15:
++			{
++				uint16* d = (uint16*)(dst + py * dstBPR) + dstLeft;
++				for (int32 px = dstLeft; px <= dstRight; px++) {
++					*d++ = (uint16)(((s[2] & 0xf8) << 7)
++						| ((s[1] & 0xf8) << 2) | (s[0] >> 3));
++					s += srcStep;
++				}
++				break;
++			}
++			case B_RGB24:
++			{
++				uint8* d = dst + py * dstBPR + dstLeft * 3;
++				for (int32 px = dstLeft; px <= dstRight; px++) {
++					d[0] = s[0];
++					d[1] = s[1];
++					d[2] = s[2];
++					d += 3;
++					s += srcStep;
++				}
++				break;
++			}
++			default:
++				fprintf(stderr, "HWInterface: display rotation is not "
++					"supported in color space 0x%x, use 32 bit\n", space);
++				return;
++		}
++	}
++}
++
++
+ /*!	The object must be locked
+ */
+ IntRect
+diff --git a/src/servers/app/drawing/HWInterface.h b/src/servers/app/drawing/HWInterface.h
+index 65992d5..7360525 100644
+--- a/src/servers/app/drawing/HWInterface.h
++++ b/src/servers/app/drawing/HWInterface.h
+@@ -141,6 +141,10 @@ public:
+ 	virtual	RenderingBuffer*	BackBuffer() const = 0;
+ 	virtual	bool				IsDoubleBuffered() const = 0;
+ 
++	// software display rotation, clockwise degrees (0, 90, 180, 270);
++	// everything above the HWInterface sees the rotated ("logical") screen
++			int32				Rotation() const { return fRotation; }
++
+ 	// Invalidate is used for scheduling an area for updating
+ 	virtual	status_t			InvalidateRegion(const BRegion& region);
+ 	virtual	status_t			Invalidate(const BRect& frame);
+@@ -180,6 +184,9 @@ protected:
+ 	// does the actual transfer and handles color space conversion
+ 			void				_CopyToFront(uint8* src, uint32 srcBPR, int32 x,
+ 									int32 y, int32 right, int32 bottom) const;
++			void				_CopyToFrontRotated(uint8* src, uint32 srcBPR,
++									int32 x, int32 y, int32 right,
++									int32 bottom) const;
+ 
+ 			IntRect				_CursorFrame() const;
+ 			void				_RestoreCursorArea() const;
+@@ -243,6 +250,8 @@ protected:
+ 
+ 			int					fVGADevice;
+ 
++			int32				fRotation;
++
+ private:
+ 			BList				fListeners;
+ };
+diff --git a/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp b/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp
+index 6b122d6..5ed7fbb 100644
+--- a/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp
++++ b/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "AccelerantHWInterface.h"
+ 
++#include <algorithm>
+ #include <new>
+ 
+ #include <dirent.h>
+@@ -34,6 +35,7 @@
+ 
+ #include <Accelerant.h>
+ #include <Cursor.h>
++#include <DisplayRotation.h>
+ #include <Directory.h>
+ #include <FindDirectory.h>
+ #include <Path.h>
+@@ -93,6 +95,22 @@ use_fail_safe_video_mode()
+ }
+ 
+ 
++/*!	Swaps the horizontal and vertical parts of a display_mode. Doing it
++	twice gives back the original mode, so the same function converts
++	between the physical (driver) and the logical (rotated) view.
++*/
++static void
++swap_mode_axes(display_mode& mode)
++{
++	std::swap(mode.virtual_width, mode.virtual_height);
++	std::swap(mode.h_display_start, mode.v_display_start);
++	std::swap(mode.timing.h_display, mode.timing.v_display);
++	std::swap(mode.timing.h_sync_start, mode.timing.v_sync_start);
++	std::swap(mode.timing.h_sync_end, mode.timing.v_sync_end);
++	std::swap(mode.timing.h_total, mode.timing.v_total);
++}
++
++
+ //	#pragma mark - AccelerantHWInterface
+ 
+ 
+@@ -185,6 +203,11 @@ AccelerantHWInterface::Initialize()
+ {
+ 	status_t ret = HWInterface::Initialize();
+ 
++	fRotation = BPrivate::get_display_rotation("display");
++	if (fRotation != 0)
++		syslog(LOG_INFO, "app_server: display rotated by %d degrees\n",
++			(int)fRotation);
++
+ 	if (!fRectParams || !fBlitParams)
+ 		return B_NO_MEMORY;
+ 
+@@ -545,9 +568,14 @@ AccelerantHWInterface::_SetFallbackMode(display_mode& newMode) const
+ 
+ 
+ status_t
+-AccelerantHWInterface::SetMode(const display_mode& mode)
++AccelerantHWInterface::SetMode(const display_mode& logicalMode)
+ {
+ 	AutoWriteLocker _(this);
++
++	// the rest of app_server talks in rotated (logical) modes, the driver
++	// needs the physical one
++	display_mode mode = logicalMode;
++	_ToPhysicalMode(mode);
+ 	// TODO: There are places this function can fail,
+ 	// maybe it needs to roll back changes in case of an
+ 	// error.
+@@ -572,8 +600,15 @@ AccelerantHWInterface::SetMode(const display_mode& mode)
+ 	display_mode newMode = mode;
+ 
+ 	status_t status = B_ERROR;
+-	if (!use_fail_safe_video_mode() || !fInitialModeSwitch)
++	if (!use_fail_safe_video_mode() || !fInitialModeSwitch) {
+ 		status = fAccSetDisplayMode(&newMode);
++		if (status != B_OK && _IsAxisSwapped()) {
++			// a mode stored before rotation was turned on is already
++			// physical
++			newMode = logicalMode;
++			status = fAccSetDisplayMode(&newMode);
++		}
++	}
+ 	if (status != B_OK) {
+ 		ATRACE(("setting display mode failed\n"));
+ 		if (!fInitialModeSwitch)
+@@ -634,10 +669,16 @@ AccelerantHWInterface::SetMode(const display_mode& mode)
+ 
+ 	_UpdateHooksAfterModeChange();
+ 
++	// the back buffer has the logical (rotated) size
++	uint32 backWidth = fFrontBuffer->Width();
++	uint32 backHeight = fFrontBuffer->Height();
++	if (_IsAxisSwapped())
++		std::swap(backWidth, backHeight);
++
+ 	// update backbuffer if necessary
+ 	if (!fBackBuffer.IsSet()
+-		|| fBackBuffer->Width() != fFrontBuffer->Width()
+-		|| fBackBuffer->Height() != fFrontBuffer->Height()
++		|| fBackBuffer->Width() != backWidth
++		|| fBackBuffer->Height() != backHeight
+ 		|| (fFrontBuffer->ColorSpace() == B_RGB32 && fBackBuffer.IsSet())) {
+ 		// NOTE: backbuffer is always B_RGBA32, this simplifies the
+ 		// drawing backend implementation tremendously for the time
+@@ -645,8 +686,7 @@ AccelerantHWInterface::SetMode(const display_mode& mode)
+ 
+ 		fBackBuffer.Unset();
+ 
+-		fBackBuffer.SetTo(new(nothrow) MallocBuffer(
+-			fFrontBuffer->Width(), fFrontBuffer->Height()));
++		fBackBuffer.SetTo(new(nothrow) MallocBuffer(backWidth, backHeight));
+ 
+ 		status = fBackBuffer.IsSet()
+ 			? fBackBuffer->InitCheck() : B_NO_MEMORY;
+@@ -676,6 +716,7 @@ AccelerantHWInterface::GetMode(display_mode* mode)
+ {
+ 	if (mode && LockParallelAccess()) {
+ 		*mode = fDisplayMode;
++		_ToLogicalMode(*mode);
+ 		UnlockParallelAccess();
+ 	}
+ }
+@@ -749,6 +790,8 @@ AccelerantHWInterface::GetModeList(display_mode** _modes, uint32* _count)
+ 		if (*_modes) {
+ 			*_count = fModeCount;
+ 			memcpy(*_modes, fModeList, sizeof(display_mode) * fModeCount);
++			for (int32 i = 0; i < fModeCount; i++)
++				_ToLogicalMode((*_modes)[i]);
+ 		} else {
+ 			*_count = 0;
+ 			status = B_NO_MEMORY;
+@@ -766,7 +809,9 @@ AccelerantHWInterface::GetPixelClockLimits(display_mode *mode, uint32* _low,
+ 		return B_BAD_VALUE;
+ 
+ 	AutoReadLocker _(this);
+-	return fAccGetPixelClockLimits(mode, _low, _high);
++	display_mode physicalMode = *mode;
++	_ToPhysicalMode(physicalMode);
++	return fAccGetPixelClockLimits(&physicalMode, _low, _high);
+ }
+ 
+ 
+@@ -803,12 +848,28 @@ AccelerantHWInterface::ProposeMode(display_mode* candidate,
+ 	high = *_high;
+ 	low = *_low;
+ 
+-	return fAccProposeDisplayMode(candidate, &low, &high);
++	_ToPhysicalMode(*candidate);
++	_ToPhysicalMode(low);
++	_ToPhysicalMode(high);
++
++	status_t status = fAccProposeDisplayMode(candidate, &low, &high);
++	_ToLogicalMode(*candidate);
++	return status;
+ }
+ 
+ 
+ status_t
+ AccelerantHWInterface::GetPreferredMode(display_mode* preferredMode)
++{
++	status_t status = _GetPreferredPhysicalMode(preferredMode);
++	if (status == B_OK)
++		_ToLogicalMode(*preferredMode);
++	return status;
++}
++
++
++status_t
++AccelerantHWInterface::_GetPreferredPhysicalMode(display_mode* preferredMode)
+ {
+ 	status_t status = B_NOT_SUPPORTED;
+ 
+@@ -1099,6 +1160,11 @@ AccelerantHWInterface::GetDriverPath(BString& string)
+ overlay_token
+ AccelerantHWInterface::AcquireOverlayChannel()
+ {
++	// hardware overlays would show up unrotated, let clients fall back
++	// to drawing bitmaps
++	if (fRotation != 0)
++		return NULL;
++
+ 	if (fAccAllocateOverlay == NULL
+ 		|| fAccReleaseOverlay == NULL)
+ 		return NULL;
+@@ -1232,7 +1298,9 @@ AccelerantHWInterface::SetCursor(ServerCursor* cursor)
+ 
+ 	bool cursorSet = false;
+ 
+-	if (fAccSetCursorBitmap != NULL) {
++	// the hardware cursor lives in physical coordinates and is not
++	// rotated, use the software cursor instead
++	if (fRotation == 0 && fAccSetCursorBitmap != NULL) {
+ 		// Bitmap cursor
+ 		// TODO are x and y switched for this, too?
+ 		uint16 xHotSpot = (uint16)cursor->GetHotSpot().x;
+@@ -1247,7 +1315,8 @@ AccelerantHWInterface::SetCursor(ServerCursor* cursor)
+ 			cursor->Bits()) == B_OK;
+ 	}
+ 
+-	if (!cursorSet && cursor->CursorData() != NULL && fAccSetCursorShape != NULL) {
++	if (!cursorSet && fRotation == 0 && cursor->CursorData() != NULL
++		&& fAccSetCursorShape != NULL) {
+ 		// BeOS BCursor, 16x16 monochrome
+ 		uint8 size = cursor->CursorData()[0];
+ 		// CursorData()[1] is color depth (always monochrome)
+@@ -1348,6 +1417,32 @@ AccelerantHWInterface::MoveCursorTo(float x, float y)
+ }
+ 
+ 
++// #pragma mark - rotation
++
++
++bool
++AccelerantHWInterface::_IsAxisSwapped() const
++{
++	return fRotation == 90 || fRotation == 270;
++}
++
++
++void
++AccelerantHWInterface::_ToPhysicalMode(display_mode& mode) const
++{
++	if (_IsAxisSwapped())
++		swap_mode_axes(mode);
++}
++
++
++void
++AccelerantHWInterface::_ToLogicalMode(display_mode& mode) const
++{
++	if (_IsAxisSwapped())
++		swap_mode_axes(mode);
++}
++
++
+ // #pragma mark - buffer access
+ 
+ 
+diff --git a/src/servers/app/drawing/interface/local/AccelerantHWInterface.h b/src/servers/app/drawing/interface/local/AccelerantHWInterface.h
+index 7717b03..69f6ca4 100644
+--- a/src/servers/app/drawing/interface/local/AccelerantHWInterface.h
++++ b/src/servers/app/drawing/interface/local/AccelerantHWInterface.h
+@@ -111,6 +111,11 @@ private:
+ 			void				_SetSystemPalette();
+ 			void				_SetGrayscalePalette();
+ 
++			status_t			_GetPreferredPhysicalMode(display_mode* mode);
++			bool				_IsAxisSwapped() const;
++			void				_ToPhysicalMode(display_mode& mode) const;
++			void				_ToLogicalMode(display_mode& mode) const;
++
+ private:
+ 			int					fCardFD;
+ 			image_id			fAccelerantImage;
+-- 
+2.43.0
+

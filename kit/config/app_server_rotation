@@ -1,0 +1,6 @@
+# Copy to ~/config/settings/launch/app_server_rotation
+# Starts the patched app_server instead of the system one.
+# Delete this file to go back to the stock app_server.
+service x-vnd.Haiku-app_server {
+	launch /boot/home/config/non-packaged/servers/app_server
+}

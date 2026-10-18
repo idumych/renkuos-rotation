@@ -1,0 +1,12 @@
+# Copy to ~/config/settings/display_rotation (build.sh does this)
+#
+# right_side_up  - the same setting you use on Vitruvian OS
+# left_side_up / bottom_up - other panel mountings
+# or: normal | right | inverted | left  (picture turned clockwise 0/90/180/270)
+#
+# left_side_up is right for the Kootigers (right_side_up came out upside down).
+# If the desktop comes up upside down, switch to the other side.
+display left_side_up
+
+# Only needed if the touch screen ends up turned differently from the picture
+#touch left_side_up
