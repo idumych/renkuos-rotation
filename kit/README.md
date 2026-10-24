@@ -1,6 +1,6 @@
 # Screen rotation for RenkuOS / Haiku (personal patch)
 
-Turns the whole desktop in software, like "right side up" on Vitruvian OS.
+Turns the whole desktop in software, like "right side up" on Vitruvian OS (a BeOS-like OS based on Linux).
 Works with `intel_extreme`, VESA and framebuffer drivers alike.
 
 ## Install (on the RenkuOS or Haiku machine)

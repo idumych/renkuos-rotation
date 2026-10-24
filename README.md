@@ -137,7 +137,7 @@ display left_side_up
 | `right_side_up` | `left`, `270`, `ccw` | 270° | so its right edge points up |
 
 The `*_side_up` names are the Linux/DRM panel orientation names; Vitruvian
-OS uses `right_side_up` too. **If the desktop comes up upside down, switch to
+OS, a BeOS-like OS based on Linux, uses `right_side_up` too. **If the desktop comes up upside down, switch to
 the other `*_side_up` value.** On the Kootigers, `right_side_up` gives an
 upside-down desktop and `left_side_up` gives an upright one.
 
